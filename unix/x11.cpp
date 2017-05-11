@@ -273,6 +273,9 @@ struct GUIData
 	Image			*image;
 	uint8			*snes_buffer;
 	uint8			*filter_buffer;
+	uint32			filter_buffer_pitch;
+	uint8			*scaled_buffer;
+	uint32			scale;
 	uint8			*blit_screen;
 	uint32			blit_screen_pitch;
 	bool8			need_convert;
@@ -372,6 +375,7 @@ void S9xExtraDisplayUsage (void)
 #ifdef USE_XINERAMA
 	S9xMessage(S9X_INFO, S9X_USAGE, "-xineramahead                   Xinerama head number for multi-monitor setups");
 #endif
+	S9xMessage(S9X_INFO, S9X_USAGE, "-scale                          1-2, scales the game up by this factor (1 = 1x, 2 = 2x, ...)");
 	S9xMessage(S9X_INFO, S9X_USAGE, "");
 	S9xMessage(S9X_INFO, S9X_USAGE, "-v1                             Video mode: Blocky (default)");
 	S9xMessage(S9X_INFO, S9X_USAGE, "-v2                             Video mode: TV");
@@ -410,6 +414,17 @@ void S9xParseDisplayArg (char **argv, int &i, int argc)
 	}
 	else
 #endif
+	if (!strcasecmp(argv[i], "-scale"))
+	{
+		if (i + 1 < argc)
+			GUI.scale = atoi(argv[++i]);
+		else
+			S9xUsage();
+
+		if (!GUI.scale || GUI.scale > 2)
+			GUI.scale = 1;
+	}
+	else
 	if (!strncasecmp(argv[i], "-v", 2))
 	{
 		switch (argv[i][2])
@@ -576,6 +591,10 @@ const char * S9xParseDisplayConfig (ConfigFile &conf, int pass)
 #ifdef USE_XINERAMA
     GUI.xinerama_head = conf.GetUInt("Unix/X11::XineramaHead", 0);
 #endif
+    GUI.scale = conf.GetUInt("Unix/X11::Scale", 1);
+
+	if (!GUI.scale || GUI.scale > 2)
+		GUI.scale = 1;
 
 	if (conf.Exists("Unix/X11::VideoMode"))
 	{
@@ -833,6 +852,10 @@ static bool8 SetupXvideo()
 
 void S9xInitDisplay (int argc, char **argv)
 {
+#ifdef USE_XVIDEO
+		if (GUI.use_xvideo) GUI.scale = 1;
+#endif
+
 	GUI.display = XOpenDisplay(NULL);
 	if (GUI.display == NULL)
 		FatalError("Failed to connect to X server.");
@@ -974,27 +997,27 @@ xinerama_end:
 #endif
 		{
 			/* Last: position the output window in the center of the screen. */
-			GUI.x_offset = (screen_w - SNES_WIDTH * 2) / 2;
-			GUI.y_offset = (screen_h - SNES_HEIGHT_EXTENDED * 2) / 2;
+			GUI.x_offset = (screen_w - SNES_WIDTH * 2 * GUI.scale) / 2;
+			GUI.y_offset = (screen_h - SNES_HEIGHT_EXTENDED * 2 * GUI.scale) / 2;
 		}
 	} else {
 		/* Tell the Window Manager that we do not wish to be resizable */
 		Hints.flags      = PSize | PMinSize | PMaxSize | PPosition;
 		Hints.x          = screen_left + (screen_w - SNES_WIDTH * 2) / 2;
 		Hints.y          = screen_top + (screen_h - SNES_HEIGHT_EXTENDED * 2) / 2;
-		Hints.min_width  = Hints.max_width  = Hints.base_width  = SNES_WIDTH * 2;
-		Hints.min_height = Hints.max_height = Hints.base_height = SNES_HEIGHT_EXTENDED * 2;
+		Hints.min_width  = Hints.max_width  = Hints.base_width  = SNES_WIDTH * 2 * GUI.scale;
+		Hints.min_height = Hints.max_height = Hints.base_height = SNES_HEIGHT_EXTENDED * 2 * GUI.scale;
 
 		/* Create the window. */
 		GUI.window = XCreateWindow(GUI.display, RootWindowOfScreen(GUI.screen),
 								   Hints.x, Hints.y,
-								   SNES_WIDTH * 2, SNES_HEIGHT_EXTENDED * 2, 0, GUI.depth, InputOutput, GUI.visual, CWBackPixel | CWColormap, &attrib);
+								   SNES_WIDTH * 2 * GUI.scale, SNES_HEIGHT_EXTENDED * 2 * GUI.scale, 0, GUI.depth, InputOutput, GUI.visual, CWBackPixel | CWColormap, &attrib);
 
 		/* Last: Windowed SNES is not drawn with any offsets. */
 		GUI.x_offset = GUI.y_offset = 0;
 #ifdef USE_XVIDEO
-		GUI.scale_w = SNES_WIDTH * 2;
-		GUI.scale_h = SNES_HEIGHT_EXTENDED * 2;
+		GUI.scale_w = SNES_WIDTH * 2 * GUI.scale;
+		GUI.scale_h = SNES_HEIGHT_EXTENDED * 2 * GUI.scale;
 #endif
 	}
 
@@ -1159,6 +1182,18 @@ static void SetupImage (void)
 	if (!GUI.filter_buffer)
 		FatalError("Failed to allocate GUI.filter_buffer.");
 
+	GUI.blit_screen_pitch = GUI.filter_buffer_pitch = (SNES_WIDTH * 2) * 2;
+	GUI.scaled_buffer = GUI.filter_buffer;
+
+	if (GUI.scale != 1)
+	{
+		GUI.scaled_buffer = (uint8 *) calloc((SNES_WIDTH * 2 * GUI.scale) * 2 * (SNES_HEIGHT_EXTENDED * 2 * GUI.scale) * 2, 1);
+		if (!GUI.scaled_buffer)
+			FatalError("Failed to allocate GUI.scaled_buffer.");
+
+		GUI.blit_screen_pitch = (SNES_WIDTH * 2 * GUI.scale) * 2;
+	}
+
 #ifdef USE_XVIDEO
 	if ((GUI.depth == 15 || GUI.depth == 16) && GUI.xv_format != FOURCC_YUY2)
 #else
@@ -1171,8 +1206,7 @@ static void SetupImage (void)
 	}
 	else
 	{
-		GUI.blit_screen_pitch = (SNES_WIDTH * 2) * 2;
-		GUI.blit_screen       = GUI.filter_buffer;
+		GUI.blit_screen       = GUI.scaled_buffer;
 		GUI.need_convert      = TRUE;
 	}
 	if (GUI.need_convert) { printf("\tImage conversion needed before blit.\n"); }
@@ -1192,6 +1226,12 @@ static void TakedownImage (void)
 	{
 		free(GUI.filter_buffer);
 		GUI.filter_buffer = NULL;
+	}
+
+	if (GUI.scaled_buffer)
+	{
+		free(GUI.scaled_buffer);
+		GUI.scaled_buffer = NULL;
 	}
 
 	if (GUI.image)
@@ -1221,7 +1261,7 @@ static void SetupXImage (void)
 	if (!XShmQueryVersion(GUI.display, &major, &minor, &shared) || !shared)
 		GUI.image->ximage = NULL;
 	else
-		GUI.image->ximage = XShmCreateImage(GUI.display, GUI.visual, GUI.depth, ZPixmap, NULL, &GUI.sm_info, SNES_WIDTH * 2, SNES_HEIGHT_EXTENDED * 2);
+		GUI.image->ximage = XShmCreateImage(GUI.display, GUI.visual, GUI.depth, ZPixmap, NULL, &GUI.sm_info, SNES_WIDTH * 2 * GUI.scale, SNES_HEIGHT_EXTENDED * 2 * GUI.scale);
 
 	if (!GUI.image->ximage)
 		GUI.use_shared_memory = FALSE;
@@ -1271,7 +1311,7 @@ static void SetupXImage (void)
 	{
 		fprintf(stderr, "use_shared_memory failed, switching to XPutImage.\n");
 #endif
-		GUI.image->ximage = XCreateImage(GUI.display, GUI.visual, GUI.depth, ZPixmap, 0, NULL, SNES_WIDTH * 2, SNES_HEIGHT_EXTENDED * 2, BitmapUnit(GUI.display), 0);
+		GUI.image->ximage = XCreateImage(GUI.display, GUI.visual, GUI.depth, ZPixmap, 0, NULL, SNES_WIDTH * 2 * GUI.scale, SNES_HEIGHT_EXTENDED * 2 * GUI.scale, BitmapUnit(GUI.display), 0);
 		// set main Image struct vars
 		GUI.image->height = GUI.image->ximage->height;
 		GUI.image->bytes_per_line = GUI.image->ximage->bytes_per_line;
@@ -1333,7 +1373,7 @@ static void SetupXvImage (void)
 	if (!XShmQueryVersion(GUI.display, &major, &minor, &shared) || !shared)
 		GUI.image->xvimage = NULL;
 	else
-		GUI.image->xvimage = XvShmCreateImage(GUI.display, GUI.xv_port, GUI.xv_format, NULL, SNES_WIDTH * 2, SNES_HEIGHT_EXTENDED * 2, &GUI.sm_info);
+		GUI.image->xvimage = XvShmCreateImage(GUI.display, GUI.xv_port, GUI.xv_format, NULL, SNES_WIDTH * 2 * GUI.scale, SNES_HEIGHT_EXTENDED * 2 * GUI.scale, &GUI.sm_info);
 
 	if (!GUI.image->xvimage)
 		GUI.use_shared_memory = FALSE;
@@ -1381,7 +1421,7 @@ static void SetupXvImage (void)
 	{
 		fprintf(stderr, "use_shared_memory failed, switching to XvPutImage.\n");
 #endif
-		GUI.image->xvimage = XvCreateImage(GUI.display, GUI.xv_port, GUI.xv_format, NULL, SNES_WIDTH * 2, SNES_HEIGHT_EXTENDED * 2);
+		GUI.image->xvimage = XvCreateImage(GUI.display, GUI.xv_port, GUI.xv_format, NULL, SNES_WIDTH * 2 * GUI.scale, SNES_HEIGHT_EXTENDED * 2 * GUI.scale);
 		GUI.image->height = SNES_HEIGHT_EXTENDED * 2;
 		GUI.image->data_size = GUI.image->xvimage->data_size;
 		GUI.image->bytes_per_line = GUI.image->data_size / GUI.image->height;
@@ -1429,6 +1469,47 @@ static void TakedownXvImage (void)
 	}
 }
 #endif
+
+void scale2x (uint8 *srcPtr, int srcRowBytes, uint8 *dstPtr, int dstRowBytes, int width, int height)
+{
+	uint8	*dstPtr2 = dstPtr + dstRowBytes;
+	dstRowBytes <<= 1;
+
+	for (; height; height--)
+	{
+		uint32	*dP1 = (uint32 *) dstPtr, *dP2 = (uint32 *) dstPtr2, *bP = (uint32 *) srcPtr;
+		uint32	currentPixel, currentPixA, currentPixB, colorA, colorB;
+
+		for (int i = 0; i < (width >> 1); i++)
+		{
+			currentPixel = *bP;
+
+		#ifdef MSB_FIRST
+			colorA = (currentPixel >> 16) & 0xFFFF;
+			colorB = (currentPixel      ) & 0xFFFF;
+		#else
+			colorA = (currentPixel      ) & 0xFFFF;
+			colorB = (currentPixel >> 16) & 0xFFFF;
+		#endif
+
+			currentPixA = (colorA << 16) | colorA;
+			currentPixB = (colorB << 16) | colorB;
+
+			dP1[0] = currentPixA;
+			dP1[1] = currentPixB;
+			dP2[0] = currentPixA;
+			dP2[1] = currentPixB;
+
+			dP1 += 2;
+			dP2 += 2;
+			bP++;
+		}
+
+		srcPtr   += srcRowBytes;
+		dstPtr   += dstRowBytes;
+		dstPtr2  += dstRowBytes;
+	}
+}
 
 void S9xPutImage (int width, int height)
 {
@@ -1484,18 +1565,24 @@ void S9xPutImage (int width, int height)
 		copyHeight = height;
 		blitFn = S9xBlitPixSimple1x1;
 	}
-	blitFn((uint8 *) GFX.Screen, GFX.Pitch, GUI.blit_screen, GUI.blit_screen_pitch, width, height);
+	blitFn((uint8 *) GFX.Screen, GFX.Pitch, GUI.filter_buffer, GUI.filter_buffer_pitch, width, height);
 
 	if (height < prevHeight)
 	{
-		int	p = GUI.blit_screen_pitch >> 2;
+		int	p = GUI.filter_buffer_pitch >> 2;
 		for (int y = SNES_HEIGHT * 2; y < SNES_HEIGHT_EXTENDED * 2; y++)
 		{
-			uint32	*d = (uint32 *) (GUI.blit_screen + y * GUI.blit_screen_pitch);
+			uint32	*d = (uint32 *) (GUI.filter_buffer + y * GUI.filter_buffer_pitch);
 			for (int x = 0; x < p; x++)
 				*d++ = 0;
 		}
 	}
+
+	if (GUI.scale != 1)
+		scale2x((uint8 *) GUI.filter_buffer, GUI.filter_buffer_pitch, GUI.blit_screen, GUI.blit_screen_pitch, copyWidth, copyHeight);
+
+	copyWidth *= GUI.scale;
+	copyHeight *= GUI.scale;
 
 #ifdef USE_XVIDEO
 	// Adjust source blit region if SNES would only fill half the screen.
@@ -1673,12 +1760,12 @@ static void Repaint (bool8 isFrameBoundry)
 #ifdef MITSHM
 	if (GUI.use_shared_memory)
 	{
-		XShmPutImage(GUI.display, GUI.window, GUI.gc, GUI.image->ximage, 0, 0, GUI.x_offset, GUI.y_offset, SNES_WIDTH * 2, SNES_HEIGHT_EXTENDED * 2, False);
+		XShmPutImage(GUI.display, GUI.window, GUI.gc, GUI.image->ximage, 0, 0, GUI.x_offset, GUI.y_offset, SNES_WIDTH * 2 * GUI.scale, SNES_HEIGHT_EXTENDED * 2 * GUI.scale, False);
 		XSync(GUI.display, False);
 	}
 	else
 #endif
-		XPutImage(GUI.display, GUI.window, GUI.gc, GUI.image->ximage, 0, 0, GUI.x_offset, GUI.y_offset, SNES_WIDTH * 2, SNES_HEIGHT_EXTENDED * 2);
+		XPutImage(GUI.display, GUI.window, GUI.gc, GUI.image->ximage, 0, 0, GUI.x_offset, GUI.y_offset, SNES_WIDTH * 2 * GUI.scale, SNES_HEIGHT_EXTENDED * 2 * GUI.scale);
 
 	Window			root, child;
 	int				root_x, root_y, x, y;
@@ -1687,10 +1774,10 @@ static void Repaint (bool8 isFrameBoundry)
 	// Use QueryPointer to sync X server and as a side effect also gets current pointer position for SNES mouse emulation.
 	XQueryPointer(GUI.display, GUI.window, &root, &child, &root_x, &root_y, &x, &y, &mask);
 
-	if (x >= 0 && y >= 0 && x < SNES_WIDTH * 2 && y < SNES_HEIGHT_EXTENDED * 2)
+	if (x >= 0 && y >= 0 && x < SNES_WIDTH * 2 * GUI.scale && y < SNES_HEIGHT_EXTENDED * 2 * GUI.scale)
 	{
-		GUI.mouse_x = x >> 1;
-		GUI.mouse_y = y >> 1;
+		GUI.mouse_x = x / GUI.scale;
+		GUI.mouse_y = y / GUI.scale;
 
 		if (mask & Mod1Mask)
 		{
